@@ -1,156 +1,202 @@
-//Digital pins
-int photoResistorPowerSource = 2;
-int soilHumidityPowerSource = 3;
-//L298N relevant
-int l298NPowerSource = 6;
-int motorValveIN1 = 7;
-int motorValveIN2 = 8;
-//Analog pins
-int photoResistor = 0;  //Connected to sensor's output and grounded via 10k resistor
-int soilHumidity = 1;  //Connected to sensor's output and grounded via 10k resistor
+/*I'm using power-saving code from Donal Morrissey's Sleeping Arduino article: http://donalmorrissey.blogspot.ru/2010/04/putting-arduino-diecimila-to-sleep-part.html
+He is explaining waking up from watchdog timer the best*/
 
-//Configuration variables
-int nightLightLevel = 700;
-int soilHumidityLowLevel = 800;
-unsigned long measurementInterval = 2000;  //Overall measurement interval
-unsigned long capacitanceDelay = 500;  //Delay after sourcing power to sensors prior to measurement
-unsigned long sensorsMeasurementInterval = 500;  //Interval between measurements of each sensor
-int brightnessSeriesAssuringNight = 3;  //Number of contiguous measurements of brightness below threshold assuring night
-int humiditySeriesAssuringSoilIsDry = 3;  //Number of contiguous measurements of soil humidity below threshold assuring watering needed
-unsigned long wateringDuration = 10000;
-unsigned long wateringHoldTime = 20000;  //Minimum time interval between waterings
-unsigned long motorValveRunningDuration = 4000;  //Time needed to open or close valve
-int maxWateringsPerNight = 3;
-//End of configuration variables
+#include <avr/sleep.h>
+#include <avr/power.h>
+#include <avr/wdt.h>
 
-int measuredSoilHumidityLevel = 0;
-int measuredLightLevel = 0;
-unsigned long lastMeasurementStartTime = 0;
-unsigned long lastWateringStartTime = 0;
-int measurementStage = 0;
-int matchingLightSeries = 0;
-int matchingSoilHumiditySeries = 0;
-int wateringsLastNight = 0;
-boolean valveOpened = true;
-boolean motorValveIsRunning = false;
-unsigned long motorValveStartTime = 0;
+//Pins
+int soilMoistureSensorOut = 1;
+int photoResistorOut = 0;
+int soilMoistureSensorFeed = 2;  //Feeded through 10K resistor
+int photoResistorFeed = 4;  //Feeded through 10K resistor
+int l298nEnable = 3;
+int l298nIN3 = 8;
+int l298nIN4 = 7;
 
-void setup() {
-  pinMode(photoResistorPowerSource, OUTPUT);
-  pinMode(soilHumidityPowerSource, OUTPUT);
-  pinMode(l298NPowerSource, OUTPUT);
-  pinMode(motorValveIN1, OUTPUT);
-  pinMode(motorValveIN2, OUTPUT);
-  digitalWrite(soilHumidityPowerSource, LOW);
-  digitalWrite(photoResistorPowerSource, LOW);
-  maxWateringsPerNight--;  //Because counter starts from 0
+//Config
+int measurementInterval = 10;
+int wateringDuration = 150;
+int soilDryLevel = 400;
+int nightLightLevel = 200;
 
-  Serial.begin(9600);
+boolean sleepAllowed = true;
+boolean measurementAllowed = true;
+boolean wateringNeeded = false;
+boolean alreadyWatered = false;
+int measurementCounter = 0;
+int wateringCounter = 0;
+int wateringTimer = 0;
+int soilMoisture;
+int lightLevel;
+int lowMoistureCounter = 0;
+int lowLightCounter = 0;
 
+
+/***************************************************
+ *  Name:        ISR(WDT_vect)
+ *
+ *  Returns:     Nothing.
+ *
+ *  Parameters:  None.
+ *
+ *  Description: Watchdog Interrupt Service. This
+ *               is executed when watchdog timed out.
+ *
+ ***************************************************/
+ISR(WDT_vect) {}
+
+
+/***************************************************
+ *  Name:        enterSleep
+ *
+ *  Returns:     Nothing.
+ *
+ *  Parameters:  None.
+ *
+ *  Description: Enters the arduino into sleep mode.
+ *
+ ***************************************************/
+void enterSleep(void)
+{
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);   /* EDIT: could also use SLEEP_MODE_PWR_DOWN for lowest power consumption. */
+  sleep_enable();
+
+  /* Now enter sleep mode. */
+  sleep_mode();
+
+  /* The program will continue from here after the WDT timeout*/
+  sleep_disable(); /* First thing to do is disable sleep. */
+
+  /* Re-enable the peripherals. */
+  power_all_enable();
 }
 
-void loop() {
 
-  // Stop motor valve if it's running enough
-  if (motorValveIsRunning && ((millis() - motorValveStartTime) >= motorValveRunningDuration)) {
-    Serial.println("\tSwitching off motor valve");
-    digitalWrite(l298NPowerSource, LOW);
-    digitalWrite(motorValveIN1, LOW);
-    digitalWrite(motorValveIN2, LOW);
-    motorValveIsRunning = false;
-  }
 
-  switch (measurementStage) {
-  case 0:
-    // Start powering sensors
-    if ((millis() - lastMeasurementStartTime) >= measurementInterval) {
-        lastMeasurementStartTime = millis();
-        measurementStage++;
-        digitalWrite(photoResistorPowerSource, HIGH);
-        digitalWrite(soilHumidityPowerSource, HIGH);
+/***************************************************
+ *  Name:        setup
+ *
+ *  Returns:     Nothing.
+ *
+ *  Parameters:  None.
+ *
+ *  Description: Setup for the serial comms and the
+ *                Watch dog timeout.
+ *
+ ***************************************************/
+void setup()
+{
+  Serial.begin(9600);
+
+  /*** Setup the WDT ***/
+
+  /* Clear the reset flag. */
+  MCUSR &= ~(1 << WDRF);
+
+  /* In order to change WDE or the prescaler, we need to
+   * set WDCE (This will allow updates for 4 clock cycles).
+   */
+  WDTCSR |= (1 << WDCE) | (1 << WDE);
+
+  /* set new watchdog timeout prescaler value */
+  WDTCSR = 1 << WDP0 | 1 << WDP3; /* 8.0 seconds */
+
+  /* Enable the WD interrupt (note no reset). */
+  WDTCSR |= _BV(WDIE);
+
+  pinMode(soilMoistureSensorFeed, OUTPUT);
+  pinMode(photoResistorFeed, OUTPUT);
+  pinMode(l298nEnable, OUTPUT);
+  pinMode(l298nIN3, OUTPUT);
+  pinMode(l298nIN4, OUTPUT);
+}
+
+
+
+void loop()
+{
+  /*Serial.println(measurementCounter);
+  delay(100);*/
+
+  if (measurementAllowed) {
+    if (measurementCounter >= measurementInterval) {
+      digitalWrite(soilMoistureSensorFeed, HIGH);
+      delay(500);
+      soilMoisture = analogRead(soilMoistureSensorOut);
+      digitalWrite(soilMoistureSensorFeed, LOW);
+      if (soilMoisture >= soilDryLevel) {
+        lowMoistureCounter++;
       }
-      break;
-    case 1:
-      // Wait little more time for sensors's capacitance to be set and start measuring light level
-      if ((millis() - lastMeasurementStartTime) >= capacitanceDelay) {
-        measuredLightLevel = analogRead(photoResistor);
-
-        // Check if night is really coming by counting repetitive results below threshold
-        if (measuredLightLevel < nightLightLevel) {
-          matchingLightSeries++;
-        }
-        else {
-          matchingLightSeries = 0;
-
-          // Reset last night waterings counter
-          wateringsLastNight = 0;
-        }
-
-        measurementStage++;
+      else {
+        lowMoistureCounter = 0;
       }
-      break;
-    case 2:
-      // Start measuring soil humidity level
-      if ((millis() - lastMeasurementStartTime) >= (capacitanceDelay + sensorsMeasurementInterval)) {
-        measuredSoilHumidityLevel = analogRead(soilHumidity);
 
-        // Check if soil is really dry by counting repetitive results below threshold
-        if (measuredSoilHumidityLevel < soilHumidityLowLevel) {
-          matchingSoilHumiditySeries++;
-        }
-        else {
-          matchingSoilHumiditySeries = 0;
-        }
-
-        measurementStage++;
-
-        // Print some useful info
-        Serial.print("Light: ");
-        Serial.print(measuredLightLevel);
-        Serial.print("\tNightfall? ");
-        if (matchingLightSeries >= brightnessSeriesAssuringNight) {
-          Serial.print("Yes. ");
-          Serial.print(wateringsLastNight);
-          Serial.println(" waterings this night");
-        }
-        else Serial.println("No");
-        Serial.print("Soil humidity: ");
-        Serial.println(measuredSoilHumidityLevel);
+      digitalWrite(photoResistorFeed, HIGH);
+      delay(500);
+      lightLevel = analogRead(photoResistorOut);
+      digitalWrite(photoResistorFeed, LOW);
+      if (lightLevel >= nightLightLevel) {
+        lowLightCounter++;
       }
-      break;
-    case 3:
-      // Power off sensors
-      digitalWrite(photoResistorPowerSource, LOW);
-      digitalWrite(soilHumidityPowerSource, LOW);
-      measurementStage = 0;
+      else {
+        lowLightCounter = 0;
+        alreadyWatered = false;
+      }
+
+      if ((lowMoistureCounter >= 3) && (lowLightCounter >= 3)) {
+        Serial.println("Watering needed");
+        wateringNeeded = true;
+      }
+      else {
+        wateringNeeded = false;
+      }
+
+      measurementCounter = 0;
+
+      Serial.print("Soil moisture:\t");
+      Serial.println(soilMoisture);
+      Serial.print("Light level:\t");
+      Serial.println(lightLevel);
+      Serial.print("Waterings:\t");
+      Serial.println(wateringCounter);
+      delay(100);
+    }
+    else {
+      measurementCounter++;
+    }
   }
 
-  // Start watering
-  if (((millis() - lastWateringStartTime) >= (wateringDuration + wateringHoldTime)) && \
-      (motorValveIsRunning == false) && \
-      (wateringsLastNight <= maxWateringsPerNight) && \
-      (matchingLightSeries >= brightnessSeriesAssuringNight) \
-      /*&& (matchingSoilHumiditySeries >= humiditySeriesAssuringSoilIsDry)*/) {
-    lastWateringStartTime = millis();
-    digitalWrite(l298NPowerSource, HIGH);
-    digitalWrite(motorValveIN1, HIGH);
-    digitalWrite(motorValveIN2, LOW);
-    motorValveStartTime = millis();
-    valveOpened = true;
-    motorValveIsRunning = true;
-    Serial.println("\tStart watering. Opening valve");
+  if ((wateringNeeded) && !(alreadyWatered)) {
+    if (wateringTimer == 0) {
+      //Serial.println("Start watering");
+      digitalWrite(l298nEnable, HIGH);
+      digitalWrite(l298nIN3, HIGH);
+      digitalWrite(l298nIN4, LOW);
+      delay(5000);
+      digitalWrite(l298nEnable, LOW);
+      digitalWrite(l298nIN3, LOW);
+      digitalWrite(l298nIN4, LOW);
+      measurementAllowed = false;
+    }
+
+    wateringTimer++;
+
+    if (wateringTimer >= wateringDuration) {
+      //Serial.println("Stop watering");
+      digitalWrite(l298nEnable, HIGH);
+      digitalWrite(l298nIN3, LOW);
+      digitalWrite(l298nIN4, HIGH);
+      delay(5000);
+      digitalWrite(l298nEnable, LOW);
+      digitalWrite(l298nIN3, LOW);
+      digitalWrite(l298nIN4, LOW);
+      measurementAllowed = true;
+      wateringTimer = 0;
+      wateringCounter++;
+      alreadyWatered = true;
+    }
   }
 
-  // Stop watering
-  if (valveOpened && ((millis() - lastWateringStartTime) >= wateringDuration)) {
-    digitalWrite(l298NPowerSource, HIGH);
-    digitalWrite(motorValveIN1, LOW);
-    digitalWrite(motorValveIN2, HIGH);
-    wateringsLastNight++;
-    motorValveStartTime = millis();
-    valveOpened = false;
-    motorValveIsRunning = true;
-    Serial.println("\tStop watering. Closing valve");
-  }
-
+  enterSleep();
 }
